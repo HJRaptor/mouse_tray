@@ -2,34 +2,60 @@
 
 The dialog only knows how to read/write a :class:`Config`; persisting the result
 and refreshing the running tray is the caller's job (see ``app._open_settings``).
+The one exception is "Start with Windows": it is not part of ``Config`` --
+Windows' ``Run`` key is its only store (see :mod:`mouse_tray.autostart`) -- so the dialog
+reads it on open and writes it itself on OK.
 
-The font picker lists only monospaced faces (the indicator needs fixed-width
-digits) and previews each one in its own face. Face names are resolved back to a
-``.ttf``/``.otf`` file so PIL can load them.
+The font picker lists monospaced faces by default (the indicator wants
+fixed-width digits) and previews each one in its own face; the "Show all fonts"
+checkbox widens it to every installed face. Face names are resolved back to a
+``.ttf``/``.otf`` file so PIL can load them. Every font, text-size, outline or
+battery-icon change is also offered to the caller for a live tray repaint,
+without waiting for OK.
 """
 
 from __future__ import annotations
 
 import os
 import winreg
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import wx
 import wx.adv
 from PIL import ImageFont
 
+from .. import autostart
 from ..build_info import version_string
-from ..config import LOW_THRESHOLD, MID_THRESHOLD, Config
+from ..config import LOW_THRESHOLD, MID_THRESHOLD, TEXT_SIZE_MAX, TEXT_SIZE_MIN, Config
 from ..logging_setup import open_log
 from ..resources import icon_path
 
 
-def open_settings(parent: wx.Window, config: Config) -> bool:
+@dataclass(frozen=True)
+class PreviewHooks:
+    """Callbacks the dialog fires so the caller can repaint the tray live.
+
+    Each fires every time its control changes (and on "Reset to defaults");
+    ``font`` receives the picked font file, or ``None`` when the selection
+    clears. The caller must drop the previews once the dialog returns.
+    """
+
+    font: Callable[[str | None], None] | None = None
+    size: Callable[[int], None] | None = None
+    outline: Callable[[bool], None] | None = None
+    battery_icon: Callable[[bool], None] | None = None
+
+
+def open_settings(parent: wx.Window, config: Config, preview: PreviewHooks | None = None) -> bool:
     """Show the modal settings dialog, centered on screen.
 
     On OK the edited values are written back onto ``config`` in place and
     ``True`` is returned; on Cancel nothing changes and ``False`` is returned.
+    ``preview`` hooks, when given, repaint the tray live as the user edits
+    (see :class:`PreviewHooks`).
     """
-    dialog = _SettingsDialog(parent, config)
+    dialog = _SettingsDialog(parent, config, preview or PreviewHooks())
     try:
         if dialog.ShowModal() != wx.ID_OK:
             return False
@@ -74,17 +100,46 @@ def _font_files() -> dict[str, str]:
     return result
 
 
+def _collect_faces() -> tuple[list[str], set[str], dict[str, str], dict[str, str]]:
+    """Every installed face plus the lookups the picker and previews need.
+
+    Returns the sorted face list, the lowercased monospaced faces, and the
+    face-to-file / file-to-face maps (built from :func:`_font_files`).
+    """
+    file_map = _font_files()
+    all_faces = sorted(
+        face
+        for face in wx.FontEnumerator.GetFacenames()
+        if not face.startswith("@") and face.lower() in file_map
+    )
+    mono_faces = {
+        face.lower()
+        for face in wx.FontEnumerator.GetFacenames(fixedWidthOnly=True)
+        if not face.startswith("@")
+    }
+    face_to_path = {face: file_map[face.lower()] for face in all_faces}
+    path_to_face = {
+        os.path.basename(path).lower(): face for face, path in face_to_path.items()
+    }
+    return all_faces, mono_faces, face_to_path, path_to_face
+
+
 def _rgb(picker: wx.ColourPickerCtrl) -> tuple[int, int, int]:
     colour = picker.GetColour()
     return (colour.Red(), colour.Green(), colour.Blue())
 
 
 class _FontPicker(wx.adv.OwnerDrawnComboBox):
-    """Read-only combo that previews each (monospaced) face in its own font."""
+    """Read-only combo that previews each face in its own font."""
 
     def __init__(self, parent: wx.Window, faces: list[str]):
         super().__init__(parent, choices=faces, style=wx.CB_READONLY)
         self._faces = faces
+
+    def set_faces(self, faces: list[str]) -> None:
+        """Replace the list of faces, keeping the owner-drawn preview working."""
+        self._faces = faces
+        self.Set(faces)
 
     def OnDrawItem(  # noqa: N802 (wx override)
         self, dc: wx.DC, rect: wx.Rect, item: int, flags: int
@@ -95,10 +150,14 @@ class _FontPicker(wx.adv.OwnerDrawnComboBox):
         dc.SetFont(
             wx.Font(11, wx.FONTFAMILY_MODERN, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL, faceName=face)
         )
-        if flags & wx.adv.ODCB_PAINTING_SELECTED:
-            colour = wx.SYS_COLOUR_HIGHLIGHTTEXT
-        else:
-            colour = wx.SYS_COLOUR_WINDOWTEXT
+        # The closed control also arrives with the SELECTED flag; it paints its
+        # own light field background, so the text must stay dark there --
+        # highlight white would turn white-on-white.
+        selected = bool(flags & wx.adv.ODCB_PAINTING_SELECTED)
+        in_control = bool(flags & wx.adv.ODCB_PAINTING_CONTROL)
+        colour = (
+            wx.SYS_COLOUR_HIGHLIGHTTEXT if selected and not in_control else wx.SYS_COLOUR_WINDOWTEXT
+        )
         dc.SetTextForeground(wx.SystemSettings.GetColour(colour))
         dc.DrawText(face, rect.x + 4, rect.y + (rect.height - dc.GetCharHeight()) // 2)
 
@@ -107,47 +166,39 @@ class _FontPicker(wx.adv.OwnerDrawnComboBox):
 
 
 class _SettingsDialog(wx.Dialog):
-    def __init__(self, parent: wx.Window, config: Config):
+    def __init__(
+        self,
+        parent: wx.Window,
+        config: Config,
+        preview: PreviewHooks,
+    ):
         super().__init__(parent, title=f"{config.display_name} {version_string()} settings")
         self.SetIcon(wx.Icon(icon_path("app.ico")))
+        self._preview = preview
 
-        file_map = _font_files()
-        faces = sorted(
-            face
-            for face in wx.FontEnumerator.GetFacenames(fixedWidthOnly=True)
-            if not face.startswith("@") and face.lower() in file_map
-        )
-        self._face_to_path = {face: file_map[face.lower()] for face in faces}
-        self._path_to_face = {
-            os.path.basename(path).lower(): face for face, path in self._face_to_path.items()
-        }
+        self._all_faces, self._mono_faces, self._face_to_path, self._path_to_face = _collect_faces()
 
-        grid = wx.FlexGridSizer(rows=6, cols=2, vgap=8, hgap=8)
+        grid = wx.FlexGridSizer(rows=10, cols=2, vgap=8, hgap=8)
         grid.AddGrowableCol(1, 1)
 
         grid.Add(wx.StaticText(self, label="Poll interval (s):"), 0, wx.ALIGN_CENTER_VERTICAL)
         self._poll = wx.SpinCtrl(self, min=1, max=3600, initial=int(config.poll_rate))
         grid.Add(self._poll, 0, wx.EXPAND)
 
-        grid.Add(wx.StaticText(self, label="Font (monospaced):"), 0, wx.ALIGN_CENTER_VERTICAL)
-        self._font = _FontPicker(self, faces)
-        grid.Add(self._font, 1, wx.EXPAND)
+        self._build_font_section(grid)
 
-        grid.Add(wx.StaticText(self, label="Font color:"), 0, wx.ALIGN_CENTER_VERTICAL)
-        self._color = wx.ColourPickerCtrl(self, colour=wx.Colour(*config.foreground_color))
-        self._mid_color = wx.ColourPickerCtrl(self, colour=wx.Colour(*config.mid_color))
-        self._low_color = wx.ColourPickerCtrl(self, colour=wx.Colour(*config.low_color))
-        # The low-band pickers sit next to the font color -- it is the color of
-        # the top band -- and only show up while "Color by charge level" is on.
-        colors = wx.BoxSizer(wx.HORIZONTAL)
-        colors.Add(self._color, 0, wx.ALIGN_CENTER_VERTICAL)
-        self._band_widgets: list[wx.Window] = []
-        for threshold, picker in ((MID_THRESHOLD, self._mid_color), (LOW_THRESHOLD, self._low_color)):
-            text = wx.StaticText(self, label=f"≤ {threshold}%:")
-            colors.Add(text, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 12)
-            colors.Add(picker, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
-            self._band_widgets += [text, picker]
-        grid.Add(colors, 1, wx.EXPAND)
+        self._build_size_row(grid, config.text_size)
+
+        self._text_outline = self._add_checkbox(
+            grid,
+            "Text outline:",
+            config.text_outline,
+            "Draw a contrasting outline around the tray digits.\n"
+            "Keeps them readable on a same-colored taskbar.",
+        )
+        self._text_outline.Bind(wx.EVT_CHECKBOX, self._on_outline)
+
+        self._build_color_row(grid, config)
 
         self._dynamic_color = self._add_checkbox(
             grid,
@@ -165,6 +216,16 @@ class _SettingsDialog(wx.Dialog):
             "Draw a battery filled to the charge level instead of\n"
             "the percent digits. The exact number moves to the\n"
             "tray tooltip.",
+        )
+        self._battery_icon.Bind(wx.EVT_CHECKBOX, self._on_battery_icon)
+        self._app_name = config.app_name
+        self._autostart_was = autostart.is_enabled(config.app_name)
+        self._autostart = self._add_checkbox(
+            grid,
+            "Start with Windows:",
+            self._autostart_was,
+            "Run the program when you sign in to Windows.\n"
+            "Also shown on the Startup tab of Task Manager.",
         )
         self._debug = self._add_checkbox(grid, "Debug logging:", config.debug)
 
@@ -188,7 +249,7 @@ class _SettingsDialog(wx.Dialog):
         self.SetMinSize(self.GetSize())
         self.CentreOnScreen()
 
-        self._select_font(config.font)
+        self._restore_font_selection(config)
         # Hide after fitting: the dialog keeps the width of the shown state, so
         # toggling the checkbox never resizes the window under the cursor.
         self._update_bands()
@@ -211,10 +272,92 @@ class _SettingsDialog(wx.Dialog):
         grid.Add(box, 0, wx.ALIGN_CENTER_VERTICAL)
         return box
 
+    def _build_font_section(self, grid: wx.FlexGridSizer) -> None:
+        """Append the font picker row and the "Show all fonts" checkbox."""
+        self._font_label = wx.StaticText(self, label="Font (monospaced):")
+        grid.Add(self._font_label, 0, wx.ALIGN_CENTER_VERTICAL)
+        self._font = _FontPicker(self, list(self._all_faces))
+        self._font.Bind(wx.EVT_COMBOBOX, self._on_font_selected)
+        grid.Add(self._font, 1, wx.EXPAND)
+
+        self._all_fonts = self._add_checkbox(
+            grid,
+            "Show all fonts:",
+            False,
+            "List every installed font, not just monospaced ones.\n"
+            "The digits are measured in the chosen face, so any font fits.",
+        )
+        self._all_fonts.Bind(wx.EVT_CHECKBOX, self._on_all_fonts)
+
+    def _build_size_row(self, grid: wx.FlexGridSizer, text_size: int) -> None:
+        """Append the text-size slider row with its live percent label."""
+        grid.Add(wx.StaticText(self, label="Text size:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        size_value = min(TEXT_SIZE_MAX, max(TEXT_SIZE_MIN, text_size))
+        self._size = wx.Slider(
+            self, minValue=TEXT_SIZE_MIN, maxValue=TEXT_SIZE_MAX, value=size_value,
+            style=wx.SL_HORIZONTAL,
+        )
+        self._size.SetToolTip(
+            "Scale the tray digits.\n100% fills the icon; lower values shrink."
+        )
+        self._size_label = wx.StaticText(self, label=f"{size_value}%")
+        # Reserve the widest value's width so the row never jumps; measured in
+        # the label's own font, so it survives DPI scaling (a fixed 40px clipped
+        # the "%" at 150%).
+        widest = self._size_label.GetTextExtent(f"{TEXT_SIZE_MAX}%").width
+        self._size_label.SetMinSize((widest, -1))
+        self._size.Bind(wx.EVT_SLIDER, self._on_size_changed)
+        size_row = wx.BoxSizer(wx.HORIZONTAL)
+        size_row.Add(self._size, 1, wx.ALIGN_CENTER_VERTICAL)
+        size_row.Add(self._size_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 8)
+        grid.Add(size_row, 1, wx.EXPAND)
+
+    def _build_color_row(self, grid: wx.FlexGridSizer, config: Config) -> None:
+        """Append the font color picker with its low-band pickers."""
+        grid.Add(wx.StaticText(self, label="Font color:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self._color = wx.ColourPickerCtrl(self, colour=wx.Colour(*config.foreground_color))
+        self._mid_color = wx.ColourPickerCtrl(self, colour=wx.Colour(*config.mid_color))
+        self._low_color = wx.ColourPickerCtrl(self, colour=wx.Colour(*config.low_color))
+        # The low-band pickers sit next to the font color -- it is the color of
+        # the top band -- and only show up while "Color by charge level" is on.
+        colors = wx.BoxSizer(wx.HORIZONTAL)
+        colors.Add(self._color, 0, wx.ALIGN_CENTER_VERTICAL)
+        self._band_widgets: list[wx.Window] = []
+        for threshold, picker in ((MID_THRESHOLD, self._mid_color), (LOW_THRESHOLD, self._low_color)):
+            text = wx.StaticText(self, label=f"≤ {threshold}%:")
+            colors.Add(text, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 12)
+            colors.Add(picker, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
+            self._band_widgets += [text, picker]
+        grid.Add(colors, 1, wx.EXPAND)
+
+    def _restore_font_selection(self, config: Config) -> None:
+        """Show the saved font, widening the list for a proportional face."""
+        # Start widened if the saved font is a proportional face, so it shows.
+        current_face = self._path_to_face.get(os.path.basename(config.font).lower())
+        self._all_fonts.SetValue(
+            bool(current_face) and current_face.lower() not in self._mono_faces
+        )
+        self._populate_faces()
+        self._select_font(config.font)
+
     def _select_font(self, font: str) -> None:
         face = self._path_to_face.get(os.path.basename(font).lower())
         if face:
             self._font.SetStringSelection(face)
+
+    def _populate_faces(self) -> None:
+        """Fill the picker with all faces or just the monospaced ones."""
+        show_all = self._all_fonts.GetValue()
+        faces = (
+            list(self._all_faces)
+            if show_all
+            else [face for face in self._all_faces if face.lower() in self._mono_faces]
+        )
+        keep = self._font.GetStringSelection()
+        self._font.set_faces(faces)
+        if keep in faces:
+            self._font.SetStringSelection(keep)
+        self._font_label.SetLabel("Font:" if show_all else "Font (monospaced):")
 
     def _update_bands(self) -> None:
         """Show the low-band pickers only while "Color by charge level" is on."""
@@ -225,6 +368,56 @@ class _SettingsDialog(wx.Dialog):
 
     # --- events -------------------------------------------------------------
 
+    def _on_font_selected(self, evt: wx.CommandEvent) -> None:
+        self._emit_font_preview()
+        evt.Skip()
+
+    def _emit_font_preview(self) -> None:
+        """Offer the current font pick to the live tray preview, if any."""
+        if self._preview.font is None:
+            return
+        face = self._font.GetStringSelection()
+        path = self._face_to_path.get(face) if face else None
+        if path is not None:
+            try:
+                ImageFont.truetype(path, 16)
+            except OSError:
+                path = None  # uninstalled mid-dialog; fall back to the current font
+        self._preview.font(path)
+
+    def _on_all_fonts(self, evt: wx.CommandEvent) -> None:
+        self._populate_faces()
+        self._emit_font_preview()  # the selection may have cleared
+        evt.Skip()
+
+    def _on_size_changed(self, evt: wx.CommandEvent) -> None:
+        self._size_label.SetLabel(f"{self._size.GetValue()}%")
+        self._emit_size_preview()
+        evt.Skip()
+
+    def _emit_size_preview(self) -> None:
+        """Offer the current size pick to the live tray preview, if any."""
+        if self._preview.size is not None:
+            self._preview.size(self._size.GetValue())
+
+    def _on_outline(self, evt: wx.CommandEvent) -> None:
+        self._emit_outline_preview()
+        evt.Skip()
+
+    def _emit_outline_preview(self) -> None:
+        """Offer the current outline pick to the live tray preview, if any."""
+        if self._preview.outline is not None:
+            self._preview.outline(self._text_outline.GetValue())
+
+    def _on_battery_icon(self, evt: wx.CommandEvent) -> None:
+        self._emit_battery_icon_preview()
+        evt.Skip()
+
+    def _emit_battery_icon_preview(self) -> None:
+        """Offer the current battery-icon pick to the live tray preview, if any."""
+        if self._preview.battery_icon is not None:
+            self._preview.battery_icon(self._battery_icon.GetValue())
+
     def _on_dynamic_color(self, evt: wx.CommandEvent) -> None:
         self._update_bands()
         evt.Skip()
@@ -232,14 +425,25 @@ class _SettingsDialog(wx.Dialog):
     def _on_reset(self, _evt: wx.CommandEvent) -> None:
         defaults = Config()
         self._poll.SetValue(defaults.poll_rate)
+        self._all_fonts.SetValue(False)
+        self._populate_faces()
         self._select_font(defaults.font)
+        self._emit_font_preview()
+        self._size.SetValue(defaults.text_size)
+        self._size_label.SetLabel(f"{defaults.text_size}%")
+        self._emit_size_preview()
+        self._text_outline.SetValue(defaults.text_outline)
+        self._emit_outline_preview()
         self._color.SetColour(wx.Colour(*defaults.foreground_color))
         self._mid_color.SetColour(wx.Colour(*defaults.mid_color))
         self._low_color.SetColour(wx.Colour(*defaults.low_color))
         self._dynamic_color.SetValue(defaults.dynamic_color)
         self._update_bands()
         self._battery_icon.SetValue(defaults.battery_icon)
+        self._emit_battery_icon_preview()
         self._debug.SetValue(defaults.debug)
+        # Autostart is left alone: it is a system integration, not a
+        # look-and-feel default, and it never lived in Config.
 
     def _on_ok(self, evt: wx.CommandEvent) -> None:
         face = self._font.GetStringSelection()
@@ -254,7 +458,26 @@ class _SettingsDialog(wx.Dialog):
                     self,
                 )
                 return  # keep the dialog open so the user can fix it
+        if not self._apply_autostart():
+            return
         evt.Skip()  # let the standard OK handler close the dialog
+
+    def _apply_autostart(self) -> bool:
+        """Write a changed autostart choice; ``False`` keeps the dialog open."""
+        wanted = self._autostart.GetValue()
+        if wanted == self._autostart_was:
+            return True  # unchanged: leave the entry exactly as Windows has it
+        try:
+            autostart.set_enabled(self._app_name, wanted)
+        except OSError as exc:
+            wx.MessageBox(
+                f"Could not change the autostart setting:\n{exc}",
+                "Start with Windows",
+                wx.OK | wx.ICON_ERROR,
+                self,
+            )
+            return False
+        return True
 
     # --- result -------------------------------------------------------------
 
@@ -263,6 +486,8 @@ class _SettingsDialog(wx.Dialog):
         face = self._font.GetStringSelection()
         if face:
             config.font = self._face_to_path[face]
+        config.text_size = self._size.GetValue()
+        config.text_outline = self._text_outline.GetValue()
         config.foreground_color = _rgb(self._color)
         config.mid_color = _rgb(self._mid_color)
         config.low_color = _rgb(self._low_color)

@@ -14,7 +14,7 @@ file, no changes to the UI or polling code.
   VXE MAD R Major Plus, VXE R1 Pro Max, VXE R1 SE+, VGN F1 Pro, VGN F2 Pro Max
 - **Zaopin:** Z2 Mini
 - **Scyrox:** V8
-- **Dareu:** A950 Air
+- **Dareu:** A950 Air, A950 Wing
 - **G-Wolves:** Lycan
 - **MCHOSE:** L7 Pro
 - **Ninjutso:** Sora V2
@@ -23,6 +23,7 @@ file, no changes to the UI or polling code.
   Naga V2 Pro, Lancehead Wireless, Pro Click V2
 - **Lamzu:** Maya X, Inca
 - **Attack Shark:** X3
+- **A4Tech Bloody:** SG5 Pro (8K dongle)
 - **Logitech:** any Lightspeed/Bolt/Unifying mouse with the UnifiedBattery
   feature, via a receiver **or connected directly by USB cable / Bluetooth**
   (model name auto-detected over HID++) — verified on PRO X2 SUPERSTRIKE
@@ -68,6 +69,13 @@ uv run --extra build python tools/make_release.py
 # -> dist/mouse_tray/
 ```
 
+The build is a **folder**, not a single file: `mouse_tray.exe` loads Python and
+its libraries (`python314.dll` and the rest) from the `_internal\` directory next
+to it. Copy or move the whole `dist\mouse_tray\` folder — the exe on its own
+fails to start with a "python314.dll not found" error. A one-file build is
+deliberately not used: it would unpack itself into `%TEMP%` on every launch,
+starting slower and tripping antivirus heuristics more often.
+
 The resulting folder is about 37 MB. Drivers are collected as a whole
 (`--collect-submodules`), so a new driver ships without touching the script.
 Modules the app cannot reach — Pillow's codecs, `ssl` with its libcrypto/libssl,
@@ -99,6 +107,13 @@ from a dialog. Changes apply immediately and are saved to the registry
 (`HKCU\SOFTWARE\Mouse_Tray\Settings`), so they survive restarts; **Reset to
 defaults** restores the code defaults.
 
+The font picker lists monospaced faces by default (the digits want to be
+fixed-width); tick **Show all fonts** to pick any installed font. The **Text
+size** slider scales the digits from 50% to 100% of the fitted maximum, and
+**Text outline** (on by default) keeps them readable on a same-colored
+taskbar. Font, size and outline changes preview on the tray immediately,
+without closing the dialog.
+
 With **Color by charge level** enabled, the battery-percent indicator is colored
 by charge: the font color above 50%, and two extra pickers appear next to it for
 the low bands — **≤ 50%** (yellow by default) and **≤ 20%** (red by default).
@@ -107,6 +122,13 @@ With **Show battery icon** enabled, the charge level is drawn as a battery
 filled to that percent instead of as digits, and the exact number moves to the
 hover tooltip (which also shows the mouse name and time since the last full
 charge). "No mouse", sleep and unknown-level states stay textual either way.
+
+**Start with Windows** adds the program to the current user's sign-in startup
+(`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, value `Mouse_Tray`); no
+administrator rights are needed. The checkbox reflects the actual Windows
+state, including the switch on the Startup tab of Task Manager, and is not
+affected by **Reset to defaults**. If the program folder is moved, the entry is
+redirected to the new location on the next manual start.
 
 For the full set of fields (including those not exposed in the dialog), edit
 [`mouse_tray/config.py`](mouse_tray/config.py):
@@ -247,6 +269,11 @@ device index and feature indices on the first read). The interval is `poll_rate`
 reaction matters. The worker touches widgets only through `wx.CallAfter`, so all
 UI work stays on the main thread.
 
+The interval is not the only trigger: the hidden frame also listens for
+`WM_DEVICECHANGE` (`ui/devnotify.py`), so a cable plugged into the mouse or a
+dongle inserted or removed re-polls within about a second whatever the interval
+is set to. A left click on the tray icon forces a re-poll too.
+
 ### Which mouse is shown
 
 All connected mice are detected; only one is read. With no pin the worker takes
@@ -280,6 +307,7 @@ a driver module — only `detect_all_drivers()` and the `MouseDriver` contract.
 
 ```
 mouse_tray/
+  autostart.py          Start with Windows (HKCU Run value)
   battery.py            BatteryStatus — the universal status model
   config.py             settings (poll rate, colors, font)
   resources.py          PyInstaller-safe resource paths
@@ -300,10 +328,12 @@ mouse_tray/
       lamzu.py          Lamzu             (HID feature report, iface 2)
       logitech.py       Logitech          (HID++ 2.0 via receiver)
       attackshark.py    Attack Shark      (pushed HID input report 3)
+      bloody.py         A4Tech Bloody     (HID feature report 0 + input report 6)
   ui/
     icons.py            tray icon rendering (PIL digits + SVG battery)
     tray.py             TaskBarIcon wrapper
     settings.py         settings dialog
+    devnotify.py        WM_DEVICECHANGE hook: re-poll on hot-plug
     about.py            about dialog (model table from the registry)
     app.py              wx app + the single state machine
   icons/                bundled .ico assets
@@ -325,3 +355,6 @@ Each driver's protocol was ported from (or verified against) these projects:
 - **Attack Shark** — [HarukaYamamoto0/attack-shark-x11-driver](https://github.com/HarukaYamamoto0/attack-shark-x11-driver),
   whose notes on the shared messaging protocol were contributed in
   [issue #1](https://github.com/Fan4Metal/mouse_tray/issues/1)
+- **A4Tech Bloody (8K dongle)** — protocol reverse-engineered from a USB capture
+  contributed by JurecUA in
+  [issue #5](https://github.com/Fan4Metal/mouse_tray/issues/5)

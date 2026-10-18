@@ -14,7 +14,7 @@
   VXE MAD R Major Plus, VXE R1 Pro Max, VXE R1 SE+, VGN F1 Pro, VGN F2 Pro Max
 - **Zaopin:** Z2 Mini
 - **Scyrox:** V8
-- **Dareu:** A950 Air
+- **Dareu:** A950 Air, A950 Wing
 - **G-Wolves:** Lycan
 - **MCHOSE:** L7 Pro
 - **Ninjutso:** Sora V2
@@ -23,6 +23,7 @@
   Naga V2 Pro, Lancehead Wireless, Pro Click V2
 - **Lamzu:** Maya X, Inca
 - **Attack Shark:** X3
+- **A4Tech Bloody:** SG5 Pro (донгл 8K)
 - **Logitech:** любая мышь Lightspeed/Bolt/Unifying с фичей UnifiedBattery —
   через ресивер **или при прямом подключении по USB-кабелю / Bluetooth**
   (название модели определяется автоматически по HID++) — проверено на
@@ -69,6 +70,13 @@ uv run --extra build python tools/make_release.py
 # -> dist/mouse_tray/
 ```
 
+Сборка — это **папка**, а не один файл: `mouse_tray.exe` загружает Python и
+библиотеки (`python314.dll` и остальное) из каталога `_internal\` рядом с собой.
+Копируйте или переносите папку `dist\mouse_tray\` целиком — один exe без неё
+не запустится с ошибкой «не найден python314.dll». Однофайловая сборка не
+используется намеренно: она распаковывалась бы во `%TEMP%` при каждом запуске,
+стартовала бы медленнее и чаще вызывала ложные срабатывания антивирусов.
+
 Каталог сборки занимает около 37 МБ. Драйверы собираются целиком
 (`--collect-submodules`), поэтому новый драйвер попадает в сборку без правок
 скрипта. Модули, до которых приложение не дотягивается — кодеки Pillow, `ssl`
@@ -101,6 +109,13 @@ uv run --extra build python tools/make_release.py
 сохраняются в реестре (`HKCU\SOFTWARE\Mouse_Tray\Settings`), поэтому переживают
 перезапуск; кнопка **Reset to defaults** возвращает значения по умолчанию.
 
+В списке шрифтов по умолчанию только моноширинные (цифрам нужна фиксированная
+ширина); флажок **Show all fonts** открывает выбор любого установленного шрифта.
+Ползунок **Text size** масштабирует цифры от 50% до 100% подогнанного размера,
+а флажок **Text outline** (включён по умолчанию) сохраняет их читаемость на
+панели задач того же цвета. Шрифт, размер и контур сразу видны в трее, диалог
+закрывать не нужно.
+
 Если включить **Color by charge level**, индикатор заряда окрашивается по уровню
 заряда: выше 50% — цветом шрифта, а рядом с ним появляются ещё два выбора цвета
 для нижних диапазонов — **≤ 50%** (по умолчанию жёлтый) и **≤ 20%** (по
@@ -110,6 +125,14 @@ uv run --extra build python tools/make_release.py
 на текущий процент, а точное число уходит в тултип (там же имя мыши и время с
 последней полной зарядки). Состояния «нет мыши», сон и неизвестный уровень в
 любом случае остаются текстовыми.
+
+Флажок **Start with Windows** добавляет программу в автозагрузку текущего
+пользователя (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, значение
+`Mouse_Tray`); права администратора не требуются. Флажок отражает фактическое
+состояние Windows, включая переключатель на вкладке «Автозагрузка» Диспетчера
+задач, и не сбрасывается кнопкой **Reset to defaults**. При переносе папки с
+программой запись перенаправляется на новое расположение при следующем ручном
+запуске.
 
 Полный набор полей (включая те, которых нет в диалоге) — в
 [`mouse_tray/config.py`](mouse_tray/config.py):
@@ -287,6 +310,7 @@ guard-условий, по одному на состояние: нет мыши
 
 ```
 mouse_tray/
+  autostart.py          автозапуск с Windows (значение HKCU Run)
   battery.py            BatteryStatus — универсальная модель статуса
   config.py             настройки (интервал опроса, цвета, шрифт)
   resources.py          пути к ресурсам, совместимые с PyInstaller
@@ -307,6 +331,7 @@ mouse_tray/
       lamzu.py          Lamzu             (HID feature-отчёт, iface 2)
       logitech.py       Logitech          (HID++ 2.0 через приёмник)
       attackshark.py    Attack Shark      (входящий HID-отчёт 3, push)
+      bloody.py         A4Tech Bloody     (HID feature-отчёт 0 + входящий отчёт 6)
   ui/
     icons.py            отрисовка значка трея (цифры PIL + SVG-батарейка)
     tray.py             обёртка над TaskBarIcon
@@ -332,3 +357,6 @@ mouse_tray/
 - **Attack Shark** — [HarukaYamamoto0/attack-shark-x11-driver](https://github.com/HarukaYamamoto0/attack-shark-x11-driver);
   заметки по общему протоколу сообщений присланы в
   [issue #1](https://github.com/Fan4Metal/mouse_tray/issues/1)
+- **A4Tech Bloody (донгл 8K)** — протокол восстановлен по USB-захвату,
+  присланному JurecUA в
+  [issue #5](https://github.com/Fan4Metal/mouse_tray/issues/5)
